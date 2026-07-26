@@ -1,10 +1,9 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, ConfigDict
+import sqlite3
 import hashlib
 import json
-import sqlite3
 import time
-import os
 
 
 app = FastAPI()
@@ -13,38 +12,40 @@ app = FastAPI()
 DB = "agent.db"
 
 
-# -------------------------
+# ----------------------------
 # Database
-# -------------------------
+# ----------------------------
+
+def db():
+
+    return sqlite3.connect(DB)
+
+
 
 def init_db():
 
-    conn = sqlite3.connect(DB)
+    conn = db()
+    cur = conn.cursor()
 
-    c = conn.cursor()
 
-
-    c.execute("""
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS proposals(
         fingerprint TEXT PRIMARY KEY,
         dossier_id TEXT,
-        action TEXT,
-        call_id TEXT,
         proposal TEXT
     )
     """)
 
 
-    c.execute("""
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS evaluations(
         evaluation_id TEXT PRIMARY KEY,
-        digest TEXT,
-        receipt_key TEXT
+        digest TEXT
     )
     """)
 
 
-    c.execute("""
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS commits(
         receipt_id TEXT PRIMARY KEY,
         result TEXT
@@ -61,11 +62,16 @@ init_db()
 
 
 
-# -------------------------
-# Models
-# -------------------------
+# ----------------------------
+# Request schema
+# ----------------------------
 
-class RequestBody(BaseModel):
+class AgentRequest(BaseModel):
+
+    model_config = ConfigDict(
+        extra="allow"
+    )
+
 
     operation: str
 
@@ -77,76 +83,86 @@ class RequestBody(BaseModel):
 
 
 
-# -------------------------
+# ----------------------------
 # Helpers
-# -------------------------
+# ----------------------------
 
-def fingerprint(data):
+def hash_json(data):
 
-    text = json.dumps(
+    raw = json.dumps(
         data,
         sort_keys=True,
         separators=(",", ":")
     )
 
     return hashlib.sha256(
-        text.encode()
+        raw.encode()
     ).hexdigest()
 
 
 
-def fake_ai_decision(dossier):
+def create_ai_decision(dossier):
 
     """
-    Replace this with your AI model.
-    This safe baseline avoids unsafe actions.
+    Replace this function with your AI model call.
     """
 
-
-    content = dossier.get(
-        "content",
-        ""
+    text = str(
+        dossier.get(
+            "content",
+            ""
+        )
     ).lower()
 
 
-
     if (
-        "ignore previous instructions" in content
-        or "send secret" in content
-        or "reveal" in content
+        "ignore previous instructions" in text
+        or "system prompt" in text
+        or "reveal secret" in text
+        or "send credentials" in text
     ):
 
         return {
+
             "action":
             "quarantine_item",
 
+            "target":
+            None,
+
+            "payload":
+            None,
+
             "evidence":
             [
-                "Message contains instructions attempting to control processing"
-            ],
+                "Content attempts to control agent behavior"
+            ]
 
-            "target": None,
-
-            "payload": None
         }
 
 
 
-    if "unsubscribe" in content:
+    if (
+        "already completed" in text
+        or "duplicate" in text
+    ):
 
         return {
 
             "action":
             "no_action",
 
+            "target":
+            None,
+
+            "payload":
+            None,
+
             "evidence":
             [
-                "Request is informational"
-            ],
+                "Message indicates duplicate or completed work"
+            ]
 
-            "target": None,
-
-            "payload": None
         }
 
 
@@ -156,51 +172,49 @@ def fake_ai_decision(dossier):
         "action":
         "request_confirmation",
 
-        "evidence":
-        [
-            "Identity or authorization requires confirmation"
-        ],
-
         "target":
         "approval_queue",
 
         "payload":
         {
             "reason":
-            "needs verification"
-        }
+            "identity or authorization requires confirmation"
+        },
+
+        "evidence":
+        [
+            "Authorization is unclear"
+        ]
 
     }
 
 
 
-# -------------------------
-# Main endpoint
-# -------------------------
+
+# ----------------------------
+# Endpoint
+# ----------------------------
 
 @app.post("/")
-def agent(req: RequestBody):
+async def agent(req: AgentRequest):
 
 
-    if req.operation not in [
-        "propose",
-        "commit"
-    ]:
-
-        raise HTTPException(
-            400,
-            "invalid operation"
-        )
-
-
-    # =====================
+    # ==========================
     # PROPOSE
-    # =====================
+    # ==========================
 
     if req.operation == "propose":
 
 
-        if not req.dossiers:
+        if req.evaluationId is None:
+
+            raise HTTPException(
+                400,
+                "missing evaluationId"
+            )
+
+
+        if req.dossiers is None:
 
             raise HTTPException(
                 400,
@@ -208,18 +222,21 @@ def agent(req: RequestBody):
             )
 
 
-        conn = sqlite3.connect(DB)
+        # Validate duplicate IDs
 
-        c = conn.cursor()
+        ids = []
+
+        for d in req.dossiers:
+
+            if not isinstance(d, dict):
+
+                raise HTTPException(
+                    400,
+                    "invalid dossier"
+                )
 
 
-        proposals=[]
-
-
-        for dossier in req.dossiers:
-
-
-            if "id" not in dossier:
+            if "id" not in d:
 
                 raise HTTPException(
                     400,
@@ -227,12 +244,37 @@ def agent(req: RequestBody):
                 )
 
 
-            fp = fingerprint(
+            ids.append(
+                d["id"]
+            )
+
+
+        if len(ids) != len(set(ids)):
+
+            raise HTTPException(
+                400,
+                "duplicate dossier ids"
+            )
+
+
+
+        conn = db()
+        cur = conn.cursor()
+
+
+        proposals = []
+
+
+
+        for dossier in req.dossiers:
+
+
+            fp = hash_json(
                 dossier
             )
 
 
-            c.execute(
+            cur.execute(
                 """
                 SELECT proposal
                 FROM proposals
@@ -242,13 +284,13 @@ def agent(req: RequestBody):
             )
 
 
-            row=c.fetchone()
+            row = cur.fetchone()
 
 
 
             if row:
 
-                proposal=json.loads(
+                proposal = json.loads(
                     row[0]
                 )
 
@@ -256,33 +298,29 @@ def agent(req: RequestBody):
             else:
 
 
-                proposal = fake_ai_decision(
+                proposal = create_ai_decision(
                     dossier
                 )
 
 
-                call_id = hashlib.sha256(
+                proposal["callId"] = hashlib.sha256(
                     (
-                    fp+
-                    str(time.time())
+                        fp +
+                        str(time.time())
                     ).encode()
                 ).hexdigest()
 
 
-                proposal["callId"]=call_id
 
-
-                c.execute(
+                cur.execute(
                     """
                     INSERT INTO proposals
-                    VALUES(?,?,?,?,?)
+                    VALUES(?,?,?)
                     """,
                     (
-                    fp,
-                    dossier["id"],
-                    proposal["action"],
-                    call_id,
-                    json.dumps(proposal)
+                        fp,
+                        dossier["id"],
+                        json.dumps(proposal)
                     )
                 )
 
@@ -293,20 +331,20 @@ def agent(req: RequestBody):
             )
 
 
-        digest=fingerprint(
+
+        digest = hash_json(
             proposals
         )
 
 
-        c.execute(
+        cur.execute(
             """
             INSERT OR REPLACE INTO evaluations
-            VALUES(?,?,?)
+            VALUES(?,?)
             """,
             (
-            req.evaluationId,
-            digest,
-            ""
+                req.evaluationId,
+                digest
             )
         )
 
@@ -323,20 +361,19 @@ def agent(req: RequestBody):
 
             "proposals":
             proposals
+
         }
 
 
 
-
-    # =====================
+    # ==========================
     # COMMIT
-    # =====================
+    # ==========================
+
+    if req.operation == "commit":
 
 
-    if req.operation=="commit":
-
-
-        if not req.receipts:
+        if req.receipts is None:
 
             raise HTTPException(
                 400,
@@ -344,15 +381,23 @@ def agent(req: RequestBody):
             )
 
 
-        conn=sqlite3.connect(DB)
+        conn = db()
+        cur = conn.cursor()
 
-        c=conn.cursor()
 
+        outcomes = []
 
-        outcomes=[]
 
 
         for receipt in req.receipts:
+
+
+            if not isinstance(receipt, dict):
+
+                raise HTTPException(
+                    400,
+                    "invalid receipt"
+                )
 
 
             receipt_id = receipt.get(
@@ -364,11 +409,12 @@ def agent(req: RequestBody):
 
                 raise HTTPException(
                     400,
-                    "invalid receipt"
+                    "missing receipt id"
                 )
 
 
-            c.execute(
+
+            cur.execute(
                 """
                 SELECT result
                 FROM commits
@@ -378,7 +424,7 @@ def agent(req: RequestBody):
             )
 
 
-            existing=c.fetchone()
+            existing = cur.fetchone()
 
 
 
@@ -392,7 +438,7 @@ def agent(req: RequestBody):
 
 
 
-            result={
+            result = {
 
                 "receiptId":
                 receipt_id,
@@ -403,14 +449,14 @@ def agent(req: RequestBody):
             }
 
 
-            c.execute(
+            cur.execute(
                 """
                 INSERT INTO commits
                 VALUES(?,?)
                 """,
                 (
-                receipt_id,
-                json.dumps(result)
+                    receipt_id,
+                    json.dumps(result)
                 )
             )
 
@@ -435,3 +481,10 @@ def agent(req: RequestBody):
             outcomes
 
         }
+
+
+
+    raise HTTPException(
+        400,
+        "invalid operation"
+    )
